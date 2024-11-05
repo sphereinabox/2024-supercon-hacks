@@ -1,0 +1,498 @@
+* 2024-10-27
+I drew in onenote the mappings between LEDS and segment/digit pins
+
+The PNP placement file can be used to locate the LEDs relative to the origin
+postive Y is up, unlike kicad
+I've copied into thi8s my current layout in mm. Positive X is right, positive Y is up
+
+How do I write data?
+it says write command byte then data byte then continue writing data bytes auto-incrementing
+says for low 8 bits of address for digit 0-7 see:
+ - table 9 on p14
+   - code-B font
+ - table 10 on p14
+   - hex font
+ - table 11 on p15
+   - no-decode segment lines.
+
+|         | D7 | D6 | D5 | D4 | D3 | D2 | D1 | D0 |
+| segment | DP | A  | B  | C  | D  | E  | F  | G  |
+
+What operations from reading the datasheet would I want?
+ - turn off:
+   - set shutdown on, 0x0C write 0x80 to leave feature register alone or 0x00 to reset feature register settings
+ - turn on
+   - set shutdown off, 0x0C write 0x01 to reset feature register?
+   - set feature register 0x0E to reset, don't blink
+   - set 0x09 decode enable register to 0x0 for no decoding
+ - init i2c self-addressing (using KEYA connection to SEGG/SEGF)
+   - no jumpers changes address to 0x00
+ - set overall intensity
+ - set intensity of digit
+ - set digit(s)
+   - D0: write 0x01 address then data
+   - ...
+   - D7: write 0x08 address then data
+ - scan keys
+
+weird, is page 12 listing D8-D15 as the first byte you write for the address?
+then the next byte(s) is the value(s)?
+
+so, if I want to just do wire.write(bytes) to set all digits
+I could use the first byte, for address, also as the 0th element... so digit 0 being address 1 in both i2c memory and digit thing
+
+I wonder if at 700hz I can get some effective "intensity" by just updating the value enough on/off
+
+I'm thinking something like:
+#+BEGIN_SRC
+i2cdata = bytearray([0]*9)
+for x,y,digit,mask in pixels:
+   color_float = eval_animation(x,y,t)
+   color_bool = eval_fade(x,y,t)
+   b = i2cdata[1+digit]
+   if color_bool: b |= mask
+   else: b = (b & ~mask)
+   i2cdata[1+digit] = b
+with i2c.open(0x00): i2c.write(i2cdata)
+#+END_SRC
+
+* 2024-11-01
+Looks like I can update all LEDs at once pretty easily:
+
+#+BEGIN_SRC
+# try turning on all petal LEDs, but not RGB:
+b = bytearray([0b01111111]*8)
+# update all at once:
+petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+#+END_SRC
+
+this works
+#+BEGIN_SRC
+if petal_bus:
+    # try turning on all petal LEDs, but not RGB:
+    b = bytearray([0b01111111]*8)
+    # update all at once:
+    petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+    print("Are the petal LEDs on?")
+
+    t = 0
+    while True:
+        for digit, mask, x, y in petal_leds:
+            on = ((y+t) % 15) < 5
+            if on:
+                b[digit] = b[digit] | mask
+            else:
+                b[digit] = b[digit] & ~mask
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+        t = t + 0.3
+        time.sleep_ms(20)
+#+END_SRC
+
+tried dithering this way but not happy with results
+#+BEGIN_SRC
+if petal_bus:
+    # try turning on all petal LEDs, but not RGB:
+    b = bytearray([0b01111111]*8)
+    # update all at once:
+    #petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+    #print("Are the petal LEDs on?")
+    
+    cycle_period_ms = 2000
+    start_ms = time.ticks_ms()
+    rnd_prev = 0.0
+    while True:
+        t_ms = (time.ticks_ms() - start_ms) % cycle_period_ms
+        t = t_ms / cycle_period_ms
+        rnd_raw = random.uniform(-1.5,1.5)
+        rnd_filtered = .5*(rnd_raw + rnd_prev)
+        rnd_prev = rnd_raw
+        for digit, mask, x, y in petal_leds:
+            on = ((y+t*15) % 15) < 6 + rnd_filtered
+            if on:
+                b[digit] = b[digit] | mask
+            else:
+                b[digit] = b[digit] & ~mask
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+#         time.sleep_ms(1)
+#+END_SRC
+
+tempted to do 4 intensity things by computing two sets of values and showing one for say 1ms then the other for 2ms
+what update rate am I getting?
+
+getting like 220 updates per second
+#+BEGIN_SRC
+if petal_bus:
+    # try turning on all petal LEDs, but not RGB:
+    b = bytearray([0b01111111]*8)
+    # update all at once:
+    #petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+    #print("Are the petal LEDs on?")
+    cycle_period_ms = 2000
+    start_ms = time.ticks_ms()
+    rnd_prev = 0.0
+    frame_counter = 0
+    t_ms_prev = start_ms
+    while True:
+        t_ms = (time.ticks_ms() - start_ms) % cycle_period_ms
+        t = t_ms / cycle_period_ms
+        rnd_raw = random.uniform(-1.5,1.5)
+        rnd_filtered = .5*(rnd_raw + rnd_prev)
+        rnd_prev = rnd_raw
+        for digit, mask, x, y in petal_leds:
+            on = ((y+t*15) % 15) < 6 + rnd_filtered
+            if on:
+                b[digit] = b[digit] | mask
+            else:
+                b[digit] = b[digit] & ~mask
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+        # print debug updates per time cycle
+        frame_counter += 1
+        if (t_ms < t_ms_prev):
+            print(frame_counter)
+            frame_counter = 0
+        t_ms_prev = t_ms
+#         time.sleep_ms(1)
+#+END_SRC
+prints 422 every 2 seconds
+
+so I could:
+ - try with faster i2c
+ - turn off lights, compute new intensity, then do my own "intensity" thing
+
+trying 4 gray levels
+| high | low |  top |
+|------+-----+------|
+|    0 |   0 |    0 |
+|    0 |   1 |  0.5 |
+|    1 |   0 | 0.75 |
+|    1 |   1 |  1.0 |
+
+... the jump from off to "on 1ms" is huge
+the jump from "on 5ms" to "on 6ms" is like nothing
+
+#+BEGIN_SRC
+if petal_bus:
+    # try turning on all petal LEDs, but not RGB:
+    b_alloff = bytearray([0x0]*8)
+    b = bytearray([0b01111111]*8)
+    bl = bytearray([0x0]*8)
+    bh = bytearray([0x0]*8)
+    # update all at once:
+    #petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+    
+    cycle_period_ms = 1000
+    start_ms = time.ticks_ms()
+    rnd_prev = 0.0
+    frame_counter = 0
+    t_ms_prev = start_ms
+    while True:
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, b_alloff)
+
+        t_ms = (time.ticks_ms() - start_ms) % cycle_period_ms
+        t = t_ms / cycle_period_ms
+        for digit, mask, x, y in petal_leds:
+            # y-wave
+            intensity = ((y+t*20) % 20) * .05
+            ib = int((intensity * intensity) * 4)
+            hb = ib & 0x2
+            lb = ib & 0x1
+#             hb = 0.5 < intensity
+#             lb = (0.35 < intensity) and (intensity < 0.5) or (0.8 < intensity)
+            if lb: bl[digit] = bl[digit] | mask
+            else: bl[digit] = bl[digit] & ~mask
+            if hb: bh[digit] = bh[digit] | mask
+            else: bh[digit] = bh[digit] & ~mask
+#             print((lb,hb,intensity))
+#             break
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, bl)
+        time.sleep_us(800)
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, bh)
+        time.sleep_ms(5)
+        # print debug updates per time cycle
+        frame_counter += 1
+        if (t_ms < t_ms_prev):
+            print(frame_counter)
+            frame_counter = 0
+        t_ms_prev = t_ms
+#         time.sleep_ms(1)
+#+END_SRC
+
+looks like boot.py already starts i2c peripherals at 400khz
+
+well anyway let's try plasma
+
+got something somewhat working
+#+BEGIN_SRC
+if petal_bus:
+    # try turning on all petal LEDs, but not RGB:
+    b_alloff = bytearray([0x0]*8)
+    b = bytearray([0b01111111]*8)
+    bl = bytearray([0x0]*8)
+    bh = bytearray([0x0]*8)
+    # update all at once:
+    #petal_bus.writeto_mem(PETAL_ADDRESS, 1, b)
+    
+    phase = 0.0
+    phaseIncrement = 0.05
+    colorStretch = 1/130.
+    
+    cycle_period_ms = 1000
+    start_ms = time.ticks_ms()
+    rnd_prev = 0.0
+    frame_counter = 0
+    t_ms_prev = start_ms
+    while True:
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, b_alloff)
+        t_ms = (time.ticks_ms() - start_ms) % cycle_period_ms
+        t = t_ms / cycle_period_ms
+        
+        phase += phaseIncrement
+        p1 = ( (sin(phase*1.000)+1.0) * 15, (sin(phase*1.310)+1.0) * 16 + 18)
+        p2 = ( (sin(phase*1.770)+1.0) * 15, (sin(phase*2.865)+1.0) * 16 + 30)
+
+        for digit, mask, x, y in petal_leds:
+            # y-wave
+            #intensity = ((y+t*20) % 20) * .05
+            
+            # plasma
+            # Calculate the distance between this LED, and p1.
+            dist1 = ( x - p1[0], y - p1[1] ) # The vector from p1 to this LED.
+            distance = dist1[0]*dist1[0] + dist1[1]*dist1[1]
+
+            # Calculate the distance between this LED, and p2.
+            dist2 = ( x - p2[0], y - p2[1] ) # The vector from p2 to this LED.
+            # Multiply this with the other distance, this will create weird plasma values :)
+            distance *= dist2[0]*dist2[0] + dist2[1]*dist2[1]
+            distance = sqrt(distance)
+
+            # Warp the distance with a sin() function. As the distance value increases, the LEDs will get light,dark,light,dark,etc...
+            # You can use a cos() for slightly different shading, or experiment with other functions. Go crazy!
+            intensity = (sin( distance * colorStretch ) + 1.0) * 0.5 # range: 0.0...1.0
+
+            # Square the color_f value to weight it towards 0. The image will be darker and have higher contrast.
+            intensity *= intensity            
+            
+            
+            ib = int((intensity * intensity) * 4)
+            hb = ib & 0x2
+            lb = ib & 0x1
+#             hb = 0.5 < intensity
+#             lb = (0.35 < intensity) and (intensity < 0.5) or (0.8 < intensity)
+            if lb: bl[digit] = bl[digit] | mask
+            else: bl[digit] = bl[digit] & ~mask
+            if hb: bh[digit] = bh[digit] | mask
+            else: bh[digit] = bh[digit] & ~mask
+#             print((lb,hb,intensity))
+#             break
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, bl)
+        time.sleep_us(800)
+        petal_bus.writeto_mem(PETAL_ADDRESS, 1, bh)
+        time.sleep_ms(5)
+        # print debug updates per time cycle
+        frame_counter += 1
+        if (t_ms < t_ms_prev):
+            print(frame_counter)
+            frame_counter = 0
+        t_ms_prev = t_ms
+#         time.sleep_ms(1)
+#+END_SRC
+
+* Ref:
+** LED Layout
+|             x (mm) |           y (mm) | Segment | Note               |
+|--------------------+------------------+---------+--------------------|
+|   7.01771520000011 | 10.5311447999999 | 5A      |                    |
+| -0.199898000000076 |        29.809948 | 1P      | Red (pkg center)   |
+| -0.199898000000076 |        29.809948 | 2P      | Green (pkg center) |
+| -0.199898000000076 |        29.809948 | 3P      | Blue (pkg center)  |
+|   9.76088980000031 | 14.4681447999999 | 5B      |                    |
+|   11.1166910000002 | 18.9812675999999 | 5C      |                    |
+|   11.4732054000001 |       23.6635798 | 5D      |                    |
+|   11.0054898000001 | 28.1587447999999 | 5E      |                    |
+|   8.71621320000008 |       31.9716404 | 5F      |                    |
+|   4.49935600000026 | 32.9696317999999 | 5G      |                    |
+|  0.972540600000002 |       35.3215448 | 6G      |                    |
+|   4.68094060000021 |       37.7345194 | 6F      |                    |
+|   9.32908980000025 | 37.2265193999999 | 6E      |                    |
+|   12.9358898000003 | 34.7373447999998 | 6D      |                    |
+|   15.1964898000001 | 30.9273447999999 | 6C      |                    |
+|   16.1616898000004 | 26.5331447999999 | 6B      |                    |
+|   15.9838898000003 | 21.7325447999999 | 6A      |                    |
+|  -3.37085939999997 | 34.7881447999999 | 7G      |                    |
+|   -1.7198593999999 | 38.6743447999999 | 7F      |                    |
+|   1.40431520000016 | 41.4683193999999 | 7E      |                    |
+|   5.23971520000009 |       42.8907194 | 7D      |                    |
+|   9.30371519999994 | 42.8145193999999 | 7C      |                    |
+|   13.1645152000001 | 41.2651193999999 | 7B      |                    |
+|   15.8314898000001 | 38.3695193999999 | 7A      |                    |
+|  -5.19968479999989 | 30.9527701999999 | 0G      |                    |
+|  -7.48151919999987 | 34.9029019999999 | 0F      |                    |
+|   -6.6982594000001 | 39.7411193999999 | 0E      |                    |
+|  -4.43765940000003 |       43.5257194 | 0D      |                    |
+|  -1.23725940000008 |       46.3705448 | 0C      |                    |
+|   3.05531520000022 |       47.8945448 | 0B      |                    |
+|   7.60191520000012 | 48.2754939999999 | 0A      |                    |
+|  -7.94288479999977 | 11.4709955999999 | 4A      |                    |
+|  -3.26931019999961 |       11.7249448 | 4B      |                    |
+|  0.896289800000204 |       13.2489448 | 4C      |                    |
+|   4.09668980000038 | 16.0937701999999 | 4D      |                    |
+|   6.35728980000022 |       19.8783702 | 4E      |                    |
+|   7.13168500000006 |       24.7162066 | 4F      |                    |
+|   4.85871520000001 | 28.6667193999999 | 4G      |                    |
+|        -16.1724594 | 21.2499701999999 | 3A      |                    |
+|        -13.5054848 | 18.3543447999999 | 3B      |                    |
+|  -9.64468479999982 | 16.8049701999998 | 3C      |                    |
+|  -5.58068479999997 |       16.7287702 | 3D      |                    |
+|  -1.74528480000004 | 18.1511701999999 | 3E      |                    |
+|   1.37888980000025 | 20.9451447999999 | 3F      |                    |
+|   3.02988980000032 |       24.8313194 | 3G      |                    |
+|  -16.3248593999999 |       37.6329448 | 2A      |                    |
+|  -16.5026593999999 |       33.0609448 | 2B      |                    |
+|        -15.5374594 | 28.6921447999999 | 2C      |                    |
+|        -13.1244594 | 24.8821447999999 | 2D      |                    |
+|   -9.6700593999999 | 22.1389701999999 | 2E      |                    |
+|  -5.02191019999964 | 21.8849701999999 | 2F      |                    |
+|  -1.31351019999988 |       24.2979448 | 2G      |                    |
+|  -4.84032559999969 | 26.6498323999999 | 1G      |                    |
+|  -9.05718279999996 | 27.6478491999999 | 1F      |                    |
+|        -11.2956594 | 31.4607447999999 | 1E      |                    |
+|  -11.8141749999998 |       35.9559098 | 1D      |                    |
+|  -11.4576605999998 | 40.6382219999998 | 1C      |                    |
+|  -10.1018847999999 | 45.1513447999998 | 1B      |                    |
+|  -7.35868479999976 | 49.0883447999998 | 1A      |                    |
+
+
+Or sorted by digit/segment:
+|             x (mm) |           y (mm) | Segment | Digit | Bit number | Bit Mask | Note               |
+|   7.60191520000012 | 48.2754939999999 | 0A      |     0 |          6 |     0x40 |                    |
+|   3.05531520000022 |       47.8945448 | 0B      |     0 |          5 |     0x20 |                    |
+|  -1.23725940000008 |       46.3705448 | 0C      |     0 |          4 |     0x10 |                    |
+|  -4.43765940000003 |       43.5257194 | 0D      |     0 |          3 |     0x08 |                    |
+|   -6.6982594000001 | 39.7411193999999 | 0E      |     0 |          2 |     0x04 |                    |
+|  -7.48151919999987 | 34.9029019999999 | 0F      |     0 |          1 |     0x02 |                    |
+|  -5.19968479999989 | 30.9527701999999 | 0G      |     0 |          0 |     0x01 |                    |
+|  -7.35868479999976 | 49.0883447999998 | 1A      |     1 |          6 |     0x40 |                    |
+|  -10.1018847999999 | 45.1513447999998 | 1B      |     1 |          5 |     0x20 |                    |
+|  -11.4576605999998 | 40.6382219999998 | 1C      |     1 |          4 |     0x10 |                    |
+|  -11.8141749999998 |       35.9559098 | 1D      |     1 |          3 |     0x08 |                    |
+|        -11.2956594 | 31.4607447999999 | 1E      |     1 |          2 |     0x04 |                    |
+|  -9.05718279999996 | 27.6478491999999 | 1F      |     1 |          1 |     0x02 |                    |
+|  -4.84032559999969 | 26.6498323999999 | 1G      |     1 |          0 |     0x01 |                    |
+| -0.199898000000076 |        29.809948 | 1P      |     1 |          7 |     0x80 | Red (pkg center)   |
+|  -16.3248593999999 |       37.6329448 | 2A      |     2 |          6 |     0x40 |                    |
+|  -16.5026593999999 |       33.0609448 | 2B      |     2 |          5 |     0x20 |                    |
+|        -15.5374594 | 28.6921447999999 | 2C      |     2 |          4 |     0x10 |                    |
+|        -13.1244594 | 24.8821447999999 | 2D      |     2 |          3 |     0x08 |                    |
+|   -9.6700593999999 | 22.1389701999999 | 2E      |     2 |          2 |     0x04 |                    |
+|  -5.02191019999964 | 21.8849701999999 | 2F      |     2 |          1 |     0x02 |                    |
+|  -1.31351019999988 |       24.2979448 | 2G      |     2 |          0 |     0x01 |                    |
+| -0.199898000000076 |        29.809948 | 2P      |     2 |          7 |     0x80 | Green (pkg center) |
+|        -16.1724594 | 21.2499701999999 | 3A      |     3 |          6 |     0x40 |                    |
+|        -13.5054848 | 18.3543447999999 | 3B      |     3 |          5 |     0x20 |                    |
+|  -9.64468479999982 | 16.8049701999998 | 3C      |     3 |          4 |     0x10 |                    |
+|  -5.58068479999997 |       16.7287702 | 3D      |     3 |          3 |     0x08 |                    |
+|  -1.74528480000004 | 18.1511701999999 | 3E      |     3 |          2 |     0x04 |                    |
+|   1.37888980000025 | 20.9451447999999 | 3F      |     3 |          1 |     0x02 |                    |
+|   3.02988980000032 |       24.8313194 | 3G      |     3 |          0 |     0x01 |                    |
+| -0.199898000000076 |        29.809948 | 3P      |     3 |          7 |     0x80 | Blue (pkg center)  |
+|  -7.94288479999977 | 11.4709955999999 | 4A      |     4 |          6 |     0x40 |                    |
+|  -3.26931019999961 |       11.7249448 | 4B      |     4 |          5 |     0x20 |                    |
+|  0.896289800000204 |       13.2489448 | 4C      |     4 |          4 |     0x10 |                    |
+|   4.09668980000038 | 16.0937701999999 | 4D      |     4 |          3 |     0x08 |                    |
+|   6.35728980000022 |       19.8783702 | 4E      |     4 |          2 |     0x04 |                    |
+|   7.13168500000006 |       24.7162066 | 4F      |     4 |          1 |     0x02 |                    |
+|   4.85871520000001 | 28.6667193999999 | 4G      |     4 |          0 |     0x01 |                    |
+|   7.01771520000011 | 10.5311447999999 | 5A      |     5 |          6 |     0x40 |                    |
+|   9.76088980000031 | 14.4681447999999 | 5B      |     5 |          5 |     0x20 |                    |
+|   11.1166910000002 | 18.9812675999999 | 5C      |     5 |          4 |     0x10 |                    |
+|   11.4732054000001 |       23.6635798 | 5D      |     5 |          3 |     0x08 |                    |
+|   11.0054898000001 | 28.1587447999999 | 5E      |     5 |          2 |     0x04 |                    |
+|   8.71621320000008 |       31.9716404 | 5F      |     5 |          1 |     0x02 |                    |
+|   4.49935600000026 | 32.9696317999999 | 5G      |     5 |          0 |     0x01 |                    |
+|   15.9838898000003 | 21.7325447999999 | 6A      |     6 |          6 |     0x40 |                    |
+|   16.1616898000004 | 26.5331447999999 | 6B      |     6 |          5 |     0x20 |                    |
+|   15.1964898000001 | 30.9273447999999 | 6C      |     6 |          4 |     0x10 |                    |
+|   12.9358898000003 | 34.7373447999998 | 6D      |     6 |          3 |     0x08 |                    |
+|   9.32908980000025 | 37.2265193999999 | 6E      |     6 |          2 |     0x04 |                    |
+|   4.68094060000021 |       37.7345194 | 6F      |     6 |          1 |     0x02 |                    |
+|  0.972540600000002 |       35.3215448 | 6G      |     6 |          0 |     0x01 |                    |
+|   15.8314898000001 | 38.3695193999999 | 7A      |     7 |          6 |     0x40 |                    |
+|   13.1645152000001 | 41.2651193999999 | 7B      |     7 |          5 |     0x20 |                    |
+|   9.30371519999994 | 42.8145193999999 | 7C      |     7 |          4 |     0x10 |                    |
+|   5.23971520000009 |       42.8907194 | 7D      |     7 |          3 |     0x08 |                    |
+|   1.40431520000016 | 41.4683193999999 | 7E      |     7 |          2 |     0x04 |                    |
+|   -1.7198593999999 | 38.6743447999999 | 7F      |     7 |          1 |     0x02 |                    |
+|  -3.37085939999997 | 34.7881447999999 | 7G      |     7 |          0 |     0x01 |                    |
+
+** AS1115 Datasheet Decoded
+
+max i2c speed: 3.4MHz on SCL
+
+p11 and p21 describe writes as having command byte first, which are listed D15-D8, then one data byte
+
+The command byte addresses from p12 are as follows:
+| command byte | Description                            |
+|       D15-D8 |                                        |
+|--------------+----------------------------------------|
+|         0x01 | Digit 0                                |
+|         0x02 | Digit 1                                |
+|         0x03 | Digit 2                                |
+|         0x04 | Digit 3                                |
+|         0x05 | Digit 4                                |
+|         0x06 | Digit 5                                |
+|         0x07 | Digit 6                                |
+|         0x08 | Digit 7                                |
+|         0x09 | Decode-Mode                            |
+|         0x0A | Global Intensity                       |
+|         0x0B | Scan-Limit (active digits)             |
+|         0x0C | Shutdown                               |
+|         0x0D | not listed.                            |
+|         0x0E | Feature                                |
+|         0x0F | Display Test Mode                      |
+|         0x10 | DIG0:DIG1 intensity                    |
+|         0x11 | DIG2:DIG3 intensity                    |
+|         0x12 | DIG4:DIG5 intensity                    |
+|         0x13 | DIG6:DIG7 intensity                    |
+|    0x14-0x1B | LED diagnostic registers digit0-digit7 |
+|         0x1C | KEYA                                   |
+|         0x1D | KEYB                                   |
+|         0x2D | Self Addressing                        |
+
+p11 describes, for reading, you'll do a write with a single command byte, then read and it will start from the given register
+
+init:
+ - default settings on power up:
+   - address: 0x00
+   - (is in shutdown by default? 0x0C=0x00)
+   - scanning only one digit
+   - internal decoder disabled
+   - intensity control register set to minimum values
+     - 0x0A = 0x00 - global intensity
+     - 0x10-0x13 = 0x00
+   - feature: 0x00
+ - set control registers:
+| name             | address | value | meaning                                                     |
+|------------------+---------+-------+-------------------------------------------------------------|
+| shutdown         |    0x0C |  0x01 | Reset feature register to default settings                  |
+| global intensity |    0x0A |  0x0F | Most intensity. Least is 0x00. sets intensity of all digits |
+| scan-limit       |    0x0B |  0x07 | All digits 0:7                                              |
+| digit 0          |    0x01 |       |                                                             |
+| digit 1          |    0x02 |       |                                                             |
+| ...              |         |       |                                                             |
+| digit 7          |    0x08 |       |                                                             |
+|------------------+---------+-------+-------------------------------------------------------------|
+|                  |         |       | The below remain at defaults:                               |
+|------------------+---------+-------+-------------------------------------------------------------|
+| decode-mode      |    0x09 |  0x00 | no decode for digits 7:0. (default)                         |
+| feature          |    0x0E |  0x00 | user internal oscillator, don't reset settings, don't blink |
+| self-addressing  |   0x2D? |  0x00 | Use factory address                                         |
+| display test     |    0x0F |  0x00 | normal operation, don't test                                |
+
+
+Digit line:
+|         | D7 | D6 | D5 | D4 | D3 | D2 | D1 | D0 |
+|---------+----+----+----+----+----+----+----+----|
+| Segment | DP | A  | B  | C  | D  | E  | F  | G  |
+
+questions:
+ - can I write all 8 digits at once?
