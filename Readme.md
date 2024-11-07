@@ -2,6 +2,8 @@
 
 Animated LEDs across multiple SAOs coordinated with the position of every LED on each SAO.
 
+https://github.com/user-attachments/assets/b0e495b8-0465-456d-9cc3-b3e8f3bb207f
+
 <img src="images/anim-snapshot.jpg" height=300>
 
 As demoed in the badge hack competition:
